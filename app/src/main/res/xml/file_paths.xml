@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- This grants permission to share files from your app's internal files/chat_files directory -->
+    <files-path
+        name="chat_files"
+        path="chat_files/" />
+</paths>

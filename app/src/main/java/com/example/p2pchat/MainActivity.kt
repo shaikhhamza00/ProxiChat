@@ -1,11 +1,13 @@
 package com.example.p2pchat
 
+import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -15,6 +17,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
@@ -95,6 +98,7 @@ import androidx.navigation.compose.rememberNavController
 import com.example.p2pchat.common.ChatSummary
 import com.example.p2pchat.common.PrefsManager
 import com.example.p2pchat.common.UiMessage
+import com.example.p2pchat.presentation.chat.CallScreen
 import com.example.p2pchat.presentation.chat.ChatViewModel
 import com.example.p2pchat.presentation.signup.SignupActivity
 import com.example.p2pchat.ui.theme.P2PChatTheme
@@ -116,29 +120,40 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         // --- "GATEKEEPER" LOGIC ---
-        // Check if user is signed in BEFORE showing any UI
         if (PrefsManager.getPhoneNumber(this) == null) {
-            // Not signed in. Redirect to SignupActivity.
             startActivity(Intent(this, SignupActivity::class.java))
-            finish() // Close this activity
-            return // Stop executing onCreate
+            finish()
+            return
         }
         // --- END LOGIC ---
 
-        // User is signed in, proceed to show the main app UI
+        // --- MODIFIED: This block is new ---
         setContent {
             MaterialTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    // Create the ViewModel here, it will be shared by all screens
-                    // in the NavHost.
                     val viewModel: ChatViewModel = viewModel()
-                    AppNavigation(viewModel)
+                    // --- Get call state from ViewModel ---
+                    val callState by viewModel.callState.collectAsState()
+
+                    Box(Modifier.fillMaxSize()) {
+                        // 1. The main app navigation
+                        AppNavigation(viewModel)
+
+                        // 2. The Call Screen, drawn on top of everything
+                        CallScreen(
+                            callState = callState,
+                            onAccept = { viewModel.acceptCall() },
+                            onReject = { viewModel.rejectCall() },
+                            onHangup = { viewModel.hangUp() }
+                        )
+                    }
                 }
             }
         }
+        // --- END MODIFICATION ---
     }
 }
 
@@ -157,21 +172,15 @@ fun AppNavigation(viewModel: ChatViewModel) {
             ChatListScreen(
                 viewModel = viewModel,
                 onUserClick = { identifier ->
-                    // Navigate to the chat room for this user
                     navController.navigate(AppRoutes.chatRoomRoute(identifier))
                 },
-                // Handle logout
                 onLogout = {
-                    // 1. Stop all network connections
                     viewModel.cleanUp()
-                    // 2. Clear saved user data
                     PrefsManager.clear(context)
-                    // 3. Go back to Signup screen, clearing all other activities
                     val intent = Intent(context, SignupActivity::class.java).apply {
                         flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
                     }
                     context.startActivity(intent)
-                    // 4. Finish the current MainActivity
                     (context as? Activity)?.finish()
                 }
             )
@@ -179,12 +188,10 @@ fun AppNavigation(viewModel: ChatViewModel) {
 
         // --- Screen 2: The Actual Chat Room ---
         composable(AppRoutes.CHAT_ROOM) { backStackEntry ->
-            // Get the phone number from the navigation route
             val recipientId = backStackEntry.arguments?.getString("recipientId") ?: "Unknown"
-
             ChatRoomScreen(
                 viewModel = viewModel,
-                recipientId = recipientId, // Pass the recipient's ID to the chat room
+                recipientId = recipientId,
                 onNavigateBack = { navController.popBackStack() }
             )
         }
@@ -193,34 +200,26 @@ fun AppNavigation(viewModel: ChatViewModel) {
 
 /**
  * This is the "WhatsApp" style main screen.
- * It shows connection buttons and a list of connected users.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatListScreen(
     viewModel: ChatViewModel,
     onUserClick: (String) -> Unit,
-    onLogout: () -> Unit // Logout callback
+    onLogout: () -> Unit
 ) {
     val status by viewModel.status.collectAsState()
     val isConnected by viewModel.isConnected.collectAsState()
-
-    // --- Get BOTH lists ---
     val chatSummaries by viewModel.chatSummaries.collectAsState()
     val allConnectedUsers by viewModel.connectedUsers.collectAsState()
-    // ---
-
     val myIdentifier = PrefsManager.getPhoneNumber(LocalContext.current) ?: "Me"
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    // --- Logic to find users you *haven't* chatted with ---
     val activeChatRecipients = chatSummaries.map { it.recipientId }.toSet()
     val newContacts = allConnectedUsers
         .filter { it != myIdentifier && it !in activeChatRecipients }
-        .sorted() // Sort them alphabetically
-    // ---
+        .sorted()
 
-    // Clean up network connections when app is destroyed
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_DESTROY) {
@@ -238,7 +237,6 @@ fun ChatListScreen(
             TopAppBar(
                 title = { Text("Offline Chat") },
                 actions = {
-                    // Status Text
                     Text(
                         text = status,
                         modifier = Modifier.padding(horizontal = 12.dp),
@@ -246,7 +244,6 @@ fun ChatListScreen(
                         fontStyle = FontStyle.Italic,
                         style = MaterialTheme.typography.bodySmall
                     )
-                    // Logout Button
                     IconButton(onClick = onLogout) {
                         Icon(
                             imageVector = Icons.Default.Logout,
@@ -273,24 +270,19 @@ fun ChatListScreen(
                 )
             } else {
                 LazyColumn(modifier = Modifier.fillMaxWidth()) {
-
-                    // --- LIST 1: Active, sorted chats ---
                     items(chatSummaries) { summary ->
-                        // Don't show a chat head for myself
                         if (summary.recipientId != myIdentifier) {
                             ChatHeadItem(
                                 identifier = summary.recipientId,
                                 lastMessage = if (summary.isFromMe) "You: ${summary.lastMessage}" else summary.lastMessage,
                                 timestamp = formatTimestamp(summary.timestamp),
-                                unreadCount = summary.unreadCount, // Pass count
+                                unreadCount = summary.unreadCount,
                                 onClick = {
                                     onUserClick(summary.recipientId)
                                 }
                             )
                         }
                     }
-
-                    // --- LIST 2: Other connected users (new contacts) ---
                     if (newContacts.isNotEmpty()) {
                         item {
                             Text(
@@ -301,13 +293,12 @@ fun ChatListScreen(
                                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                             )
                         }
-
                         items(newContacts) { identifier ->
                             ChatHeadItem(
                                 identifier = identifier,
                                 lastMessage = "Tap to start a chat",
-                                timestamp = "", // No timestamp for new contacts
-                                unreadCount = 0, // Pass 0
+                                timestamp = "",
+                                unreadCount = 0,
                                 onClick = {
                                     onUserClick(identifier)
                                 }
@@ -323,20 +314,18 @@ fun ChatListScreen(
 /**
  * A single "Chat Head" row, now driven by ChatSummary
  */
-@OptIn(ExperimentalMaterial3Api::class) // Added for Badge
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatHeadItem(
     identifier: String,
     lastMessage: String,
     timestamp: String,
-    unreadCount: Int, // NEW
+    unreadCount: Int,
     onClick: () -> Unit
 ) {
-    // --- NEW: Determine "special effect" styles ---
     val messageWeight = if (unreadCount > 0) FontWeight.Bold else FontWeight.Normal
     val messageColor = if (unreadCount > 0) MaterialTheme.colorScheme.primary else Color.Gray
     val timestampColor = if (unreadCount > 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-    // ---
 
     Row(
         modifier = Modifier
@@ -357,34 +346,31 @@ fun ChatHeadItem(
             modifier = Modifier.weight(1f)
         ) {
             Text(
-                text = identifier, // This is the phone number
+                text = identifier,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold
             )
             Text(
                 text = lastMessage,
                 style = MaterialTheme.typography.bodyMedium,
-                color = messageColor, // MODIFIED
-                fontWeight = messageWeight, // MODIFIED
+                color = messageColor,
+                fontWeight = messageWeight,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
         }
         Spacer(modifier = Modifier.width(8.dp))
-
-        // --- NEW: Timestamp and Badge Column ---
         Column(
             horizontalAlignment = Alignment.End,
             verticalArrangement = Arrangement.Center,
-            modifier = Modifier.width(IntrinsicSize.Min) // Prevent this column from growing
+            modifier = Modifier.width(IntrinsicSize.Min)
         ) {
             Text(
                 text = timestamp,
                 style = MaterialTheme.typography.bodySmall,
-                color = timestampColor, // MODIFIED
-                fontWeight = messageWeight // MODIFIED
+                color = timestampColor,
+                fontWeight = messageWeight
             )
-            // Show badge only if count > 0
             if (unreadCount > 0) {
                 Spacer(modifier = Modifier.height(4.dp))
                 Badge(
@@ -392,7 +378,7 @@ fun ChatHeadItem(
                     contentColor = MaterialTheme.colorScheme.onPrimary
                 ) {
                     Text(
-                        text = if (unreadCount > 9) "9+" else "$unreadCount", // Show 9+ if too many
+                        text = if (unreadCount > 9) "9+" else "$unreadCount",
                         modifier = Modifier.padding(horizontal = 4.dp),
                         fontSize = 12.sp
                     )
@@ -409,16 +395,26 @@ fun ChatHeadItem(
 @Composable
 fun ChatRoomScreen(
     viewModel: ChatViewModel,
-    recipientId: String, // We now know who we are talking to
+    recipientId: String,
     onNavigateBack: () -> Unit
 ) {
     val status by viewModel.status.collectAsState()
-
-    // Observe the map of messages, but filter for *this* conversation
     val allMessages by viewModel.messages.collectAsState()
-    val messages = allMessages[recipientId] ?: emptyList() // Get only messages for this user
-
+    val messages = allMessages[recipientId] ?: emptyList()
     val context = LocalContext.current
+
+    // --- MODIFIED: This is the launcher for audio permission ---
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted: Boolean ->
+        if (isGranted) {
+            // Permission is granted. Start the call.
+            viewModel.sendCallRequest(recipientId)
+        } else {
+            // Permission denied.
+            Toast.makeText(context, "Microphone permission is required to make calls.", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     // --- Launchers for picking files ---
     val mediaPickerLauncher = rememberLauncherForActivityResult(
@@ -457,12 +453,10 @@ fun ChatRoomScreen(
         permissionsLauncher.launch(permissions)
     }
 
-    // --- NEW: Mark chat as read when entering ---
     LaunchedEffect(key1 = recipientId) {
         viewModel.markChatAsRead(recipientId)
     }
 
-    // --- NEW: Clear "currently viewing" when leaving ---
     DisposableEffect(key1 = recipientId) {
         onDispose {
             viewModel.clearCurrentlyViewedChat()
@@ -472,13 +466,19 @@ fun ChatRoomScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(recipientId) }, // Show who we're talking to
+                title = { Text(recipientId) },
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
+                    // --- MODIFIED: This is the call button ---
+                    IconButton(onClick = {
+                        audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }) {
+                        Icon(Icons.Default.Call, contentDescription = "Start Call")
+                    }
                     Text(
                         text = status,
                         modifier = Modifier.padding(end = 16.dp),
@@ -513,7 +513,6 @@ fun ChatRoomScreen(
                 .padding(horizontal = 8.dp),
             reverseLayout = true
         ) {
-            // Use the filtered message list
             items(messages.reversed()) { msg ->
                 MessageBubble(message = msg)
             }
@@ -673,18 +672,13 @@ fun FileDisplay(fileName: String, fileUri: Uri, isFromMe: Boolean) {
 private fun formatTimestamp(timestamp: Long): String {
     val now = System.currentTimeMillis()
     val diff = now - timestamp
-
     val oneDay = 1000 * 60 * 60 * 24
 
     return try {
         when {
-            // Today
             diff < oneDay -> SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(timestamp))
-            // Yesterday
             diff < oneTwoDays -> "Yesterday"
-            // This week (e.g., "Mon")
             diff < oneWeek -> SimpleDateFormat("E", Locale.getDefault()).format(Date(timestamp))
-            // Older
             else -> SimpleDateFormat("MM/dd/yy", Locale.getDefault()).format(Date(timestamp))
         }
     } catch (e: Exception) {

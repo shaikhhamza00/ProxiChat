@@ -2,6 +2,7 @@ package com.example.p2pchat.presentation.chat
 
 import android.app.Application
 import android.content.Context
+import kotlinx.coroutines.Dispatchers.Main as DispatchMain
 import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -20,6 +21,7 @@ import com.example.p2pchat.common.NetworkMessage
 import com.example.p2pchat.common.PrefsManager
 import com.example.p2pchat.common.UiMessage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -33,12 +35,15 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.io.PrintWriter
+import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.cancellation.CancellationException
 
@@ -46,12 +51,9 @@ import kotlin.coroutines.cancellation.CancellationException
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // --- State Flows ---
-
-    // NEW: This now holds ALL conversations, mapped by recipient phone number
     private val _messages = MutableStateFlow<Map<String, List<UiMessage>>>(emptyMap())
     val messages = _messages.asStateFlow()
 
-    // NEW: This holds the "Chat Head" list
     private val _chatSummaries = MutableStateFlow<List<ChatSummary>>(emptyList())
     val chatSummaries = _chatSummaries.asStateFlow()
 
@@ -64,24 +66,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _connectedUsers = MutableStateFlow<Set<String>>(emptySet())
     val connectedUsers = _connectedUsers.asStateFlow()
 
+    private val _currentlyViewedChatId = MutableStateFlow<String?>(null)
+
+    // --- NEW: Call State ---
+    private val _callState = MutableStateFlow<CallState>(CallState.Idle)
+    val callState = _callState.asStateFlow()
+
     // --- User Identifier ---
     private var myIdentifier: String = PrefsManager.getPhoneNumber(application) ?: "Unknown"
-    private val _currentlyViewedChatId = MutableStateFlow<String?>(null)
+    private var myIpAddress: String? = null // NEW: For call signaling
 
     // --- Network Components ---
     private val nsdManager = application.getSystemService(Context.NSD_SERVICE) as NsdManager
     private var serverSocket: ServerSocket? = null
-    private val clientSockets = ConcurrentHashMap<String, Socket>() // Map<PhoneNumber, Socket>
-    private var clientSocket: Socket? = null // Client's socket to the host
-
+    private val clientSockets = ConcurrentHashMap<String, Socket>()
+    private var clientSocket: Socket? = null
     private var nsdRegistrationListener: NsdManager.RegistrationListener? = null
     private var nsdDiscoveryListener: NsdManager.DiscoveryListener? = null
     private var nsdResolveListener: NsdManager.ResolveListener? = null
 
+    // --- NEW: Call Manager ---
+    private val callManager = VoiceCallManager(application)
+
     // --- Constants ---
     private val SERVICE_NAME = "LocalChatApp"
     private val SERVICE_TYPE = "_mychat._tcp."
-    private val MAX_FILE_SIZE = 15 * 1024 * 1024 // 15 MB limit
+    private val MAX_FILE_SIZE = 15 * 1024 * 1024
     private val FILE_SUBDIR = "chat_files"
 
     init {
@@ -97,12 +107,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (myIdentifier == "Unknown") return
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                // NEW: Get local IP for call signaling
+                myIpAddress = getLocalIpAddress()
+                if (myIpAddress == null) {
+                    _status.value = "Error: No Wi-Fi IP."
+                    return@launch
+                }
+                Log.d("ChatViewModel", "Host IP set to: $myIpAddress")
+
                 serverSocket = ServerSocket(0)
                 val localPort = serverSocket!!.localPort
                 _status.value = "Hosting on port $localPort..."
                 registerService(localPort)
                 _isConnected.value = true
-                _connectedUsers.update { setOf(myIdentifier) } // Add self
+                _connectedUsers.update { setOf(myIdentifier) }
 
                 while (true) {
                     val client = serverSocket!!.accept()
@@ -130,7 +148,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // --- Send Functions ---
 
-    // MODIFIED: Now requires a recipientId for 1-to-1 chat
     fun sendMessage(text: String, recipientId: String) {
         if (text.isBlank()) return
         val payload = MessagePayload.Text(text)
@@ -139,29 +156,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             recipientIdentifier = recipientId,
             payload = payload
         )
-        // Add to our own UI
         addMessageToUi(recipientId, text, null, myIdentifier, null, null)
         viewModelScope.launch(Dispatchers.IO) {
             sendNetworkMessage(networkMessage)
         }
-    }
-
-    fun markChatAsRead(conversationId: String) {
-        _currentlyViewedChatId.value = conversationId
-
-        // Update the summary list to set the unread count to 0
-        _chatSummaries.update { currentSummaries ->
-            currentSummaries.map { summary ->
-                if (summary.recipientId == conversationId) {
-                    summary.copy(unreadCount = 0)
-                } else {
-                    summary
-                }
-            }
-        }
-    }
-    fun clearCurrentlyViewedChat() {
-        _currentlyViewedChatId.value = null
     }
 
     fun sendImage(context: Context, uri: Uri, recipientId: String) = sendFileWithPayload(context, uri, recipientId) { base64, _ ->
@@ -204,7 +202,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     payload = payload
                 )
 
-                // Add to our UI
                 if (payload is MessagePayload.Image) {
                     addMessageToUi(recipientId, null, bitmap, myIdentifier, null, null)
                 } else {
@@ -220,12 +217,116 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // --- NEW: Call Signaling Functions ---
+
+    fun sendCallRequest(recipientId: String) {
+        if (myIpAddress == null) {
+            myIpAddress = getLocalIpAddress() // Try one more time
+            if (myIpAddress == null) {
+                _status.value = "Error: No local IP."
+                return
+            }
+        }
+
+        val callId = UUID.randomUUID().toString()
+        val payload = MessagePayload.CallRequest(callId, myIpAddress!!)
+        val networkMessage = NetworkMessage(
+            senderIdentifier = myIdentifier,
+            recipientIdentifier = recipientId,
+            payload = payload
+        )
+
+        _callState.value = CallState.Outgoing(callId, recipientId)
+        viewModelScope.launch(Dispatchers.IO) {
+            sendNetworkMessage(networkMessage)
+        }
+    }
+
+    fun acceptCall() {
+        val currentState = _callState.value
+        if (currentState !is CallState.Incoming) return
+        if (myIpAddress == null) {
+            myIpAddress = getLocalIpAddress()
+            if (myIpAddress == null) {
+                _status.value = "Error: No local IP."
+                return
+            }
+        }
+
+        val payload = MessagePayload.CallAccept(currentState.callId, myIpAddress!!)
+        val networkMessage = NetworkMessage(
+            senderIdentifier = myIdentifier,
+            recipientIdentifier = currentState.callerId,
+            payload = payload
+        )
+
+        _callState.value = CallState.Active(currentState.callId, currentState.callerId, currentState.callerIp)
+        viewModelScope.launch(Dispatchers.IO) {
+            sendNetworkMessage(networkMessage)
+            // Start the call!
+            callManager.startCall(viewModelScope, InetAddress.getByName(currentState.callerIp))
+        }
+    }
+
+    fun rejectCall() {
+        val currentState = _callState.value
+        if (currentState !is CallState.Incoming) return
+
+        val payload = MessagePayload.CallReject(currentState.callId)
+        val networkMessage = NetworkMessage(
+            senderIdentifier = myIdentifier,
+            recipientIdentifier = currentState.callerId,
+            payload = payload
+        )
+
+        _callState.value = CallState.Idle
+        viewModelScope.launch(Dispatchers.IO) {
+            sendNetworkMessage(networkMessage)
+        }
+    }
+
+    fun hangUp() {
+        val currentState = _callState.value
+        val (callId, recipientId) = when (currentState) {
+            is CallState.Active -> currentState.callId to currentState.recipientId
+            is CallState.Outgoing -> currentState.callId to currentState.recipientId
+            is CallState.Incoming -> currentState.callId to currentState.callerId // Also reject
+            else -> return
+        }
+
+        callManager.stopCall() // Stop local audio
+        _callState.value = CallState.Idle
+
+        val payload = MessagePayload.CallHangup(callId)
+        val networkMessage = NetworkMessage(
+            senderIdentifier = myIdentifier,
+            recipientIdentifier = recipientId,
+            payload = payload
+        )
+
+        viewModelScope.launch(Dispatchers.IO) {
+            sendNetworkMessage(networkMessage)
+        }
+    }
+
+
     // --- Private Network Logic ---
 
     private fun registerService(port: Int) {
         nsdRegistrationListener = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {}
-            override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) { _status.value = "Host failed" }
+            override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
+                Log.d("ChatViewModel", "NSD Service Registered: $serviceInfo")
+            }
+            override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                if (errorCode == 4) { // REGISTRATION_FAILED_COLLISION
+                    _status.value = "Error: A host already exists."
+                    viewModelScope.launch(DispatchMain) {
+                        cleanUp()
+                    }
+                } else {
+                    _status.value = "Host failed (Code $errorCode)"
+                }
+            }
             override fun onServiceUnregistered(serviceInfo: NsdServiceInfo) {}
             override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {}
         }
@@ -270,10 +371,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         try {
             _status.value = "Connecting to $hostAddress..."
             clientSocket = Socket(hostAddress, port)
+
+            // NEW: Get local IP for call signaling
+            myIpAddress = clientSocket!!.localAddress.hostAddress
+            Log.d("ChatViewModel", "Client IP set to: $myIpAddress")
+
             _status.value = "Connected!"
             _isConnected.value = true
 
             sendHandshake()
+
+            // Start Heartbeat Ping
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    while (isConnected.value && clientSocket != null && !clientSocket!!.isClosed) {
+                        delay(15_000)
+                        val pingMsg = NetworkMessage(myIdentifier, "System", MessagePayload.Ping())
+                        sendNetworkMessage(pingMsg)
+                    }
+                } catch (e: Exception) {
+                    Log.d("ChatViewModel", "Ping loop stopped: ${e.message}")
+                }
+            }
+
             listenToSocket(clientSocket!!)
         } catch (e: Exception) {
             _status.value = "Connection failed: ${e.message}"
@@ -284,7 +404,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun sendHandshake() {
         val handshake = NetworkMessage(
             senderIdentifier = myIdentifier,
-            recipientIdentifier = "System", // Special recipient for system messages
+            recipientIdentifier = "System",
             payload = MessagePayload.Handshake()
         )
         viewModelScope.launch(Dispatchers.IO) {
@@ -297,7 +417,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val payload = MessagePayload.UserListUpdate(userList)
         val message = NetworkMessage(
             senderIdentifier = "System",
-            recipientIdentifier = null, // null = broadcast
+            recipientIdentifier = null,
             payload = payload
         )
         viewModelScope.launch(Dispatchers.IO) {
@@ -309,8 +429,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * Main "brain" for handling all incoming data.
      */
     private suspend fun listenToSocket(socket: Socket) {
-        val context = getApplication<Application>().applicationContext
-        var clientIdentifier: String? = null // Phone number of this specific socket
+        var clientIdentifier: String? = null
 
         try {
             val reader = BufferedReader(InputStreamReader(socket.inputStream))
@@ -319,16 +438,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val networkMessage = Json.decodeFromString<NetworkMessage>(jsonMessage)
                 val payload = networkMessage.payload
 
+                // Handle Ping (ignore it)
+                if (payload is MessagePayload.Ping) {
+                    continue
+                }
+
                 // --- HOST LOGIC ---
                 if (serverSocket != null) {
                     if (payload is MessagePayload.Handshake) {
                         clientIdentifier = networkMessage.senderIdentifier
-                        clientSockets[clientIdentifier] = socket // Add to map
+                        clientSockets[clientIdentifier] = socket
                         _connectedUsers.update { it + clientIdentifier }
                         addMessageToUi(clientIdentifier, "'$clientIdentifier' joined.", null, "System", null, null)
                         broadcastUserList()
                     } else {
-                        // This is a data message (text, image, etc.)
                         val recipientId = networkMessage.recipientIdentifier
                         if (recipientId != null && recipientId != myIdentifier) {
                             // 1-to-1 message: Forward to the specific recipient
@@ -337,17 +460,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             }
                         } else {
                             // This message is for the HOST
-
-                            // ======================================================
-                            // !!! CRITICAL BUG FIX HERE !!!
-                            // ======================================================
-                            // The conversationId must be the SENDER, not ourself.
-                            // We want to add the message to the chat
-                            // with the person who sent it.
-                            //
-                            // OLD (Buggy): handleUiPayload(myIdentifier, networkMessage)
-                            //
-                            // NEW (Fixed):
                             handleUiPayload(networkMessage.senderIdentifier, networkMessage)
                         }
                     }
@@ -389,9 +501,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun handleUiPayload(conversationId: String, networkMessage: NetworkMessage) {
         val context = getApplication<Application>().applicationContext
         val senderId = networkMessage.senderIdentifier
-
-        // Don't re-add our own messages
-        if (senderId == myIdentifier) return
+        if (senderId == myIdentifier) return // Don't re-add our own messages
 
         when (val payload = networkMessage.payload) {
             is MessagePayload.Text -> {
@@ -414,7 +524,37 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 addMessageToUi(conversationId, null, null, senderId, fileName, uri)
                 _status.value = "Connected"
             }
-            else -> { /* Ignore Handshake/UserList */ }
+
+            // --- NEW: Handle Call Signaling ---
+            is MessagePayload.CallRequest -> {
+                // Only process call if not already in one
+                if (_callState.value is CallState.Idle) {
+                    _callState.value = CallState.Incoming(payload.callId, senderId, payload.callerIp)
+                    Log.d("ChatViewModel", "Incoming call from $senderId at ${payload.callerIp}")
+                }
+            }
+            is MessagePayload.CallAccept -> {
+                if (_callState.value is CallState.Outgoing) {
+                    _callState.value = CallState.Active(payload.callId, senderId, payload.receiverIp)
+                    // Start the call!
+                    callManager.startCall(viewModelScope, InetAddress.getByName(payload.receiverIp))
+                }
+            }
+            is MessagePayload.CallReject -> {
+                if (_callState.value is CallState.Outgoing) {
+                    _callState.value = CallState.Idle
+                    _status.value = "$senderId rejected the call."
+                }
+            }
+            is MessagePayload.CallHangup -> {
+                if (_callState.value is CallState.Active) {
+                    callManager.stopCall()
+                    _callState.value = CallState.Idle
+                    _status.value = "Call ended."
+                }
+            }
+
+            else -> { /* Ignore Handshake/UserList/Ping */ }
         }
     }
 
@@ -425,12 +565,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // HOST: Route the message
                 val recipientId = message.recipientIdentifier
                 if (recipientId == null) {
-                    // Broadcast (only for UserList)
                     clientSockets.values.forEach { client -> sendMessageToSocket(client, jsonMessage) }
                 } else if (recipientId == myIdentifier) {
                     // Host sent to self, just update UI (already done)
                 } else {
-                    // 1-to-1 message: Send to specific client
                     clientSockets[recipientId]?.let { recipientSocket ->
                         sendMessageToSocket(recipientSocket, jsonMessage)
                     }
@@ -451,19 +589,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // --- Utility Functions ---
-
-    // NEW: Helper to format timestamp
-    private fun formatTimestamp(timestamp: Long): String {
-        return try {
-            val sdf = SimpleDateFormat("h:mm a", Locale.getDefault())
-            sdf.format(Date(timestamp))
+    // --- NEW: Helper to get local Wi-Fi IP ---
+    private fun getLocalIpAddress(): String? {
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val intf = interfaces.nextElement()
+                val addrs = intf.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val addr = addrs.nextElement()
+                    // Check for Wi-Fi (wlan) or Ethernet (eth) and ensure it's IPv4
+                    if (!addr.isLoopbackAddress && addr is Inet4Address && (intf.name.contains("wlan") || intf.name.contains("eth"))) {
+                        return addr.hostAddress
+                    }
+                }
+            }
         } catch (e: Exception) {
-            "..."
+            Log.e("ChatViewModel", "Can't get local IP", e)
         }
+        return null
     }
 
-    // NEW: Helper to create the last message preview
+    // --- Utility Functions ---
+
     private fun createMessagePreview(message: UiMessage): String {
         return when {
             message.text != null -> message.text
@@ -474,20 +622,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // NEW: Updates the chat summary list, bringing the active chat to the top
     private fun updateChatSummary(conversationId: String, lastMessage: UiMessage) {
         _chatSummaries.update { currentSummaries ->
             val existingSummary = currentSummaries.find { it.recipientId == conversationId }
             val currentCount = existingSummary?.unreadCount ?: 0
             val isViewingThisChat = (_currentlyViewedChatId.value == conversationId)
 
-            // Increment count only if it's a new message from someone else
-            // AND we are not currently viewing that chat.
             val newUnreadCount = if (!lastMessage.isFromMe && !isViewingThisChat) {
                 currentCount + 1
             } else {
-                // If we are viewing, or if we sent the message, the count stays the same
-                // (it will be 0 if markChatAsRead was called)
                 existingSummary?.unreadCount ?: 0
             }
 
@@ -496,17 +639,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 lastMessage = createMessagePreview(lastMessage),
                 timestamp = lastMessage.timestamp,
                 isFromMe = lastMessage.isFromMe,
-                unreadCount = newUnreadCount // APPLY NEW COUNT
+                unreadCount = newUnreadCount
             )
 
             val otherSummaries = currentSummaries.filterNot { it.recipientId == conversationId }
-            listOf(summary) + otherSummaries // Prepend the new summary to the top
+            listOf(summary) + otherSummaries
         }
     }
 
-    // --- MODIFIED: addMessageToUi ---
     private fun addMessageToUi(
-        conversationId: String, // The *other* person's ID
+        conversationId: String,
         text: String? = null,
         bitmap: Bitmap? = null,
         senderIdentifier: String,
@@ -514,14 +656,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         localFileUri: Uri? = null
     ) {
         val isFromMe = (senderIdentifier == myIdentifier)
-        // Check if we are currently viewing this chat
-        val isViewingThisChat = (_currentlyViewedChatId.value == conversationId)
-
-        // Don't add to UI if it's a message from us AND we're in the chat
-        // (it's already added when we send it)
-        // ... (This logic is complex, let's simplify)
-
-        // The senderIdentifier is the "display name"
         val displayName = if (isFromMe) "Me" else senderIdentifier
 
         val uiMessage = UiMessage(
@@ -533,21 +667,36 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             localFileUri = localFileUri
         )
 
-        // Update the map of messages
         _messages.update { currentMap ->
             val currentHistory = currentMap[conversationId] ?: emptyList()
             currentMap + (conversationId to (currentHistory + uiMessage))
         }
 
-        // Update the chat summary "chat head" list
         if (senderIdentifier != "System") {
-            // Check if we should update the summary
-            // (We always update, `updateChatSummary` handles the logic)
             updateChatSummary(conversationId, uiMessage)
         }
     }
 
-    // --- All other utilities (uriToMetadata, uriToByteArray, etc.) are unchanged ---
+    // --- Unread Count Functions ---
+
+    fun markChatAsRead(conversationId: String) {
+        _currentlyViewedChatId.value = conversationId
+        _chatSummaries.update { currentSummaries ->
+            currentSummaries.map { summary ->
+                if (summary.recipientId == conversationId) {
+                    summary.copy(unreadCount = 0)
+                } else {
+                    summary
+                }
+            }
+        }
+    }
+
+    fun clearCurrentlyViewedChat() {
+        _currentlyViewedChatId.value = null
+    }
+
+    // --- File/Bitmap Utilities ---
 
     @Throws(Exception::class)
     private fun uriToMetadata(context: Context, uri: Uri): Pair<String, Long> {
@@ -618,9 +767,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         BitmapFactory.decodeByteArray(decodedBytes, 0, decodedBytes.size)
     }
 
+    // --- Cleanup ---
+
     fun cleanUp() {
         _status.value = "Cleaning up..."
         _isConnected.value = false
+        callManager.stopCall() // NEW: Stop any active call
+        _callState.value = CallState.Idle // NEW: Reset call state
         try {
             nsdRegistrationListener?.let { nsdManager.unregisterService(it) }
             nsdDiscoveryListener?.let { nsdManager.stopServiceDiscovery(it) }
@@ -632,8 +785,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             Log.e("ChatViewModel", "Cleanup error: ${e.message}", e)
         }
         _status.value = "Idle"
-        _messages.value = emptyMap() // MODIFIED
-        _chatSummaries.value = emptyList() // MODIFIED
+        _messages.value = emptyMap()
+        _chatSummaries.value = emptyList()
         _connectedUsers.value = emptySet()
     }
 

@@ -119,15 +119,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // --- "GATEKEEPER" LOGIC ---
+        // Check if user is signed in
         if (PrefsManager.getPhoneNumber(this) == null) {
             startActivity(Intent(this, SignupActivity::class.java))
             finish()
             return
         }
-        // --- END LOGIC ---
 
-        // --- MODIFIED: This block is new ---
         setContent {
             MaterialTheme {
                 Surface(
@@ -135,25 +133,33 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.background
                 ) {
                     val viewModel: ChatViewModel = viewModel()
-                    // --- Get call state from ViewModel ---
+
+                    // Collect state from ViewModel
                     val callState by viewModel.callState.collectAsState()
+                    val callDuration = viewModel.callDuration
 
                     Box(Modifier.fillMaxSize()) {
-                        // 1. The main app navigation
+                        // 1. Main app navigation
                         AppNavigation(viewModel)
 
-                        // 2. The Call Screen, drawn on top of everything
+                        // 2. Call Screen overlay (shown when not idle)
                         CallScreen(
                             callState = callState,
-                            onAccept = { viewModel.acceptCall() },
-                            onReject = { viewModel.rejectCall() },
-                            onHangup = { viewModel.hangUp() }
+                            callDurationFlow = callDuration,
+                            onAccept = {
+                                viewModel.acceptCall()
+                            },
+                            onReject = {
+                                viewModel.rejectCall()
+                            },
+                            onHangup = {
+                                viewModel.hangUp()
+                            }
                         )
                     }
                 }
             }
         }
-        // --- END MODIFICATION ---
     }
 }
 

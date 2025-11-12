@@ -23,6 +23,7 @@ import com.example.p2pchat.common.UiMessage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -68,13 +69,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _currentlyViewedChatId = MutableStateFlow<String?>(null)
 
-    // --- NEW: Call State ---
+    // --- Call State ---
     private val _callState = MutableStateFlow<CallState>(CallState.Idle)
     val callState = _callState.asStateFlow()
 
     // --- User Identifier ---
     private var myIdentifier: String = PrefsManager.getPhoneNumber(application) ?: "Unknown"
-    private var myIpAddress: String? = null // NEW: For call signaling
+    private var myIpAddress: String? = null
 
     // --- Network Components ---
     private val nsdManager = application.getSystemService(Context.NSD_SERVICE) as NsdManager
@@ -85,8 +86,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var nsdDiscoveryListener: NsdManager.DiscoveryListener? = null
     private var nsdResolveListener: NsdManager.ResolveListener? = null
 
-    // --- NEW: Call Manager ---
+    // --- Call Manager ---
     private val callManager = VoiceCallManager(application)
+
+    // Expose call duration for UI
+    val callDuration: StateFlow<Long> = callManager.callDuration
 
     // --- Constants ---
     private val SERVICE_NAME = "LocalChatApp"
@@ -107,7 +111,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (myIdentifier == "Unknown") return
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // NEW: Get local IP for call signaling
                 myIpAddress = getLocalIpAddress()
                 if (myIpAddress == null) {
                     _status.value = "Error: No Wi-Fi IP."
@@ -217,11 +220,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // --- NEW: Call Signaling Functions ---
+    // --- Call Signaling Functions ---
 
     fun sendCallRequest(recipientId: String) {
+        // Prevent calling if already in a call
+        if (_callState.value !is CallState.Idle) {
+            _status.value = "Already in a call"
+            return
+        }
+
         if (myIpAddress == null) {
-            myIpAddress = getLocalIpAddress() // Try one more time
+            myIpAddress = getLocalIpAddress()
             if (myIpAddress == null) {
                 _status.value = "Error: No local IP."
                 return
@@ -236,7 +245,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             payload = payload
         )
 
+        // Update state to Outgoing
         _callState.value = CallState.Outgoing(callId, recipientId)
+        Log.d("ChatViewModel", "Initiating call to $recipientId (CallId: $callId)")
+
         viewModelScope.launch(Dispatchers.IO) {
             sendNetworkMessage(networkMessage)
         }
@@ -244,15 +256,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun acceptCall() {
         val currentState = _callState.value
-        if (currentState !is CallState.Incoming) return
+        if (currentState !is CallState.Incoming) {
+            Log.w("ChatViewModel", "acceptCall called but not in Incoming state")
+            return
+        }
+
         if (myIpAddress == null) {
             myIpAddress = getLocalIpAddress()
             if (myIpAddress == null) {
                 _status.value = "Error: No local IP."
+                _callState.value = CallState.Idle
                 return
             }
         }
 
+        Log.d("ChatViewModel", "Accepting call from ${currentState.callerId}")
+
+        // Send acceptance signal
         val payload = MessagePayload.CallAccept(currentState.callId, myIpAddress!!)
         val networkMessage = NetworkMessage(
             senderIdentifier = myIdentifier,
@@ -260,17 +280,36 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             payload = payload
         )
 
-        _callState.value = CallState.Active(currentState.callId, currentState.callerId, currentState.callerIp)
+        // Update state to Active
+        _callState.value = CallState.Active(
+            currentState.callId,
+            currentState.callerId,
+            currentState.callerIp
+        )
+
         viewModelScope.launch(Dispatchers.IO) {
-            sendNetworkMessage(networkMessage)
-            // Start the call!
-            callManager.startCall(viewModelScope, InetAddress.getByName(currentState.callerIp))
+            try {
+                sendNetworkMessage(networkMessage)
+                // Start the audio call
+                val targetIp = InetAddress.getByName(currentState.callerIp)
+                callManager.startCall(viewModelScope, targetIp)
+                Log.d("ChatViewModel", "Call started with ${currentState.callerId}")
+            } catch (e: Exception) {
+                Log.e("ChatViewModel", "Error starting call: ${e.message}", e)
+                _status.value = "Error starting call: ${e.message}"
+                hangUp()
+            }
         }
     }
 
     fun rejectCall() {
         val currentState = _callState.value
-        if (currentState !is CallState.Incoming) return
+        if (currentState !is CallState.Incoming) {
+            Log.w("ChatViewModel", "rejectCall called but not in Incoming state")
+            return
+        }
+
+        Log.d("ChatViewModel", "Rejecting call from ${currentState.callerId}")
 
         val payload = MessagePayload.CallReject(currentState.callId)
         val networkMessage = NetworkMessage(
@@ -279,7 +318,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             payload = payload
         )
 
+        // Reset to Idle
         _callState.value = CallState.Idle
+
         viewModelScope.launch(Dispatchers.IO) {
             sendNetworkMessage(networkMessage)
         }
@@ -287,16 +328,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun hangUp() {
         val currentState = _callState.value
+
+        // Determine call details based on current state
         val (callId, recipientId) = when (currentState) {
             is CallState.Active -> currentState.callId to currentState.recipientId
             is CallState.Outgoing -> currentState.callId to currentState.recipientId
-            is CallState.Incoming -> currentState.callId to currentState.callerId // Also reject
-            else -> return
+            is CallState.Incoming -> currentState.callId to currentState.callerId
+            else -> {
+                Log.w("ChatViewModel", "hangUp called but not in any call state")
+                return
+            }
         }
 
-        callManager.stopCall() // Stop local audio
+        Log.d("ChatViewModel", "Hanging up call with $recipientId")
+
+        // Stop audio immediately
+        callManager.stopCall()
+
+        // Update state to Idle
         _callState.value = CallState.Idle
 
+        // Send hangup signal
         val payload = MessagePayload.CallHangup(callId)
         val networkMessage = NetworkMessage(
             senderIdentifier = myIdentifier,
@@ -309,7 +361,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-
     // --- Private Network Logic ---
 
     private fun registerService(port: Int) {
@@ -318,9 +369,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 Log.d("ChatViewModel", "NSD Service Registered: $serviceInfo")
             }
             override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                if (errorCode == 4) { // REGISTRATION_FAILED_COLLISION
+                if (errorCode == 4) {
                     _status.value = "Error: A host already exists."
-                    viewModelScope.launch(DispatchMain) {
+                    viewModelScope.launch(Dispatchers.Main) {
                         cleanUp()
                     }
                 } else {
@@ -340,8 +391,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun discoverServices() {
         nsdDiscoveryListener = object : NsdManager.DiscoveryListener {
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) { nsdManager.stopServiceDiscovery(this) }
-            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) { nsdManager.stopServiceDiscovery(this) }
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                nsdManager.stopServiceDiscovery(this)
+            }
+            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
+                nsdManager.stopServiceDiscovery(this)
+            }
             override fun onDiscoveryStarted(serviceType: String) {}
             override fun onDiscoveryStopped(serviceType: String) {}
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
@@ -356,7 +411,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun resolveService(serviceInfo: NsdServiceInfo) {
         nsdResolveListener = object : NsdManager.ResolveListener {
-            override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) { _status.value = "Failed to connect" }
+            override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                _status.value = "Failed to connect"
+            }
             override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
                 nsdManager.stopServiceDiscovery(nsdDiscoveryListener)
                 viewModelScope.launch(Dispatchers.IO) {
@@ -372,7 +429,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             _status.value = "Connecting to $hostAddress..."
             clientSocket = Socket(hostAddress, port)
 
-            // NEW: Get local IP for call signaling
             myIpAddress = clientSocket!!.localAddress.hostAddress
             Log.d("ChatViewModel", "Client IP set to: $myIpAddress")
 
@@ -425,9 +481,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Main "brain" for handling all incoming data.
-     */
     private suspend fun listenToSocket(socket: Socket) {
         var clientIdentifier: String? = null
 
@@ -438,7 +491,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val networkMessage = Json.decodeFromString<NetworkMessage>(jsonMessage)
                 val payload = networkMessage.payload
 
-                // Handle Ping (ignore it)
                 if (payload is MessagePayload.Ping) {
                     continue
                 }
@@ -454,12 +506,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     } else {
                         val recipientId = networkMessage.recipientIdentifier
                         if (recipientId != null && recipientId != myIdentifier) {
-                            // 1-to-1 message: Forward to the specific recipient
                             clientSockets[recipientId]?.let { recipientSocket ->
                                 sendMessageToSocket(recipientSocket, jsonMessage)
                             }
                         } else {
-                            // This message is for the HOST
                             handleUiPayload(networkMessage.senderIdentifier, networkMessage)
                         }
                     }
@@ -472,7 +522,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         is MessagePayload.Handshake -> { /* Client ignores handshakes */ }
                         else -> {
-                            // This is a data message from the host
                             handleUiPayload(networkMessage.senderIdentifier, networkMessage)
                         }
                     }
@@ -481,7 +530,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         } catch (e: Exception) {
             Log.e("ChatViewModel", "Error listening: ${e.message}", e)
         } finally {
-            // --- CLEANUP for this socket ---
             val disconnectedUser = clientIdentifier ?: socket.inetAddress.hostAddress
 
             if (serverSocket != null && clientIdentifier != null) {
@@ -497,11 +545,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // NEW: Helper to process a message payload and add it to the UI
     private suspend fun handleUiPayload(conversationId: String, networkMessage: NetworkMessage) {
         val context = getApplication<Application>().applicationContext
         val senderId = networkMessage.senderIdentifier
-        if (senderId == myIdentifier) return // Don't re-add our own messages
+        if (senderId == myIdentifier) return
 
         when (val payload = networkMessage.payload) {
             is MessagePayload.Text -> {
@@ -525,36 +572,75 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 _status.value = "Connected"
             }
 
-            // --- NEW: Handle Call Signaling ---
+            // --- Call Signaling Handlers ---
             is MessagePayload.CallRequest -> {
-                // Only process call if not already in one
+                // Only accept new calls if idle
                 if (_callState.value is CallState.Idle) {
                     _callState.value = CallState.Incoming(payload.callId, senderId, payload.callerIp)
                     Log.d("ChatViewModel", "Incoming call from $senderId at ${payload.callerIp}")
+                } else {
+                    // Auto-reject if busy
+                    Log.d("ChatViewModel", "Rejecting call from $senderId - already in call")
+                    val rejectPayload = MessagePayload.CallReject(payload.callId)
+                    val rejectMessage = NetworkMessage(myIdentifier, senderId, rejectPayload)
+                    sendNetworkMessage(rejectMessage)
                 }
             }
             is MessagePayload.CallAccept -> {
-                if (_callState.value is CallState.Outgoing) {
+                val currentState = _callState.value
+                if (currentState is CallState.Outgoing && currentState.callId == payload.callId) {
                     _callState.value = CallState.Active(payload.callId, senderId, payload.receiverIp)
-                    // Start the call!
-                    callManager.startCall(viewModelScope, InetAddress.getByName(payload.receiverIp))
+                    Log.d("ChatViewModel", "Call accepted by $senderId, starting audio...")
+
+                    try {
+                        val targetIp = InetAddress.getByName(payload.receiverIp)
+                        callManager.startCall(viewModelScope, targetIp)
+                    } catch (e: Exception) {
+                        Log.e("ChatViewModel", "Error starting call after accept: ${e.message}", e)
+                        hangUp()
+                    }
                 }
             }
             is MessagePayload.CallReject -> {
-                if (_callState.value is CallState.Outgoing) {
+                val currentState = _callState.value
+                if (currentState is CallState.Outgoing && currentState.callId == payload.callId) {
                     _callState.value = CallState.Idle
                     _status.value = "$senderId rejected the call."
+                    Log.d("ChatViewModel", "Call rejected by $senderId")
                 }
             }
             is MessagePayload.CallHangup -> {
-                if (_callState.value is CallState.Active) {
-                    callManager.stopCall()
-                    _callState.value = CallState.Idle
-                    _status.value = "Call ended."
+                val currentState = _callState.value
+                when (currentState) {
+                    is CallState.Active -> {
+                        if (currentState.callId == payload.callId) {
+                            callManager.stopCall()
+                            _callState.value = CallState.Idle
+                            _status.value = "Call ended."
+                            Log.d("ChatViewModel", "Call ended by $senderId")
+                        }
+                    }
+                    is CallState.Outgoing -> {
+                        // They cancelled while we were calling them
+                        if (currentState.callId == payload.callId) {
+                            _callState.value = CallState.Idle
+                            _status.value = "$senderId cancelled the call."
+                            Log.d("ChatViewModel", "Call cancelled by $senderId")
+                        }
+                    }
+                    is CallState.Incoming -> {
+                        // They cancelled before we answered
+                        if (currentState.callId == payload.callId) {
+                            _callState.value = CallState.Idle
+                            _status.value = "$senderId cancelled the call."
+                            Log.d("ChatViewModel", "Incoming call cancelled by $senderId")
+                        }
+                    }
+                    else -> {}
                 }
             }
 
-            else -> { /* Ignore Handshake/UserList/Ping */ }
+            else -> { /* Ignore */ }
         }
     }
 
@@ -562,19 +648,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val jsonMessage = Json.encodeToString(message)
         withContext(Dispatchers.IO) {
             if (serverSocket != null) {
-                // HOST: Route the message
                 val recipientId = message.recipientIdentifier
                 if (recipientId == null) {
                     clientSockets.values.forEach { client -> sendMessageToSocket(client, jsonMessage) }
                 } else if (recipientId == myIdentifier) {
-                    // Host sent to self, just update UI (already done)
+                    // Host sent to self
                 } else {
                     clientSockets[recipientId]?.let { recipientSocket ->
                         sendMessageToSocket(recipientSocket, jsonMessage)
                     }
                 }
             } else if (clientSocket != null) {
-                // CLIENT: Send everything to host
                 sendMessageToSocket(clientSocket!!, jsonMessage)
             }
         }
@@ -589,7 +673,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // --- NEW: Helper to get local Wi-Fi IP ---
     private fun getLocalIpAddress(): String? {
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
@@ -598,8 +681,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val addrs = intf.inetAddresses
                 while (addrs.hasMoreElements()) {
                     val addr = addrs.nextElement()
-                    // Check for Wi-Fi (wlan) or Ethernet (eth) and ensure it's IPv4
-                    if (!addr.isLoopbackAddress && addr is Inet4Address && (intf.name.contains("wlan") || intf.name.contains("eth"))) {
+                    if (!addr.isLoopbackAddress && addr is Inet4Address &&
+                        (intf.name.contains("wlan") || intf.name.contains("eth"))) {
                         return addr.hostAddress
                     }
                 }
@@ -676,8 +759,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             updateChatSummary(conversationId, uiMessage)
         }
     }
-
-    // --- Unread Count Functions ---
 
     fun markChatAsRead(conversationId: String) {
         _currentlyViewedChatId.value = conversationId
@@ -772,8 +853,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun cleanUp() {
         _status.value = "Cleaning up..."
         _isConnected.value = false
-        callManager.stopCall() // NEW: Stop any active call
-        _callState.value = CallState.Idle // NEW: Reset call state
+
+        // Stop any active call
+        callManager.stopCall()
+        _callState.value = CallState.Idle
+
         try {
             nsdRegistrationListener?.let { nsdManager.unregisterService(it) }
             nsdDiscoveryListener?.let { nsdManager.stopServiceDiscovery(it) }
@@ -784,6 +868,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         } catch (e: Exception) {
             Log.e("ChatViewModel", "Cleanup error: ${e.message}", e)
         }
+
         _status.value = "Idle"
         _messages.value = emptyMap()
         _chatSummaries.value = emptyList()

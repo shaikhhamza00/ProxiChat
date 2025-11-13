@@ -75,4 +75,6 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.0")
 
     implementation("androidx.compose.material:material-icons-extended:1.7.0-alpha02")
+
+    implementation("com.infobip:google-webrtc:1.0.0035529")
 }

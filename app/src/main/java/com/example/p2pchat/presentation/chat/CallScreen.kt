@@ -67,16 +67,14 @@ sealed interface CallState {
     ) : CallState
     data class Incoming(
         val callId: String,
-        val callerId: String,
-        val callerIp: String
+        val callerId: String
     ) : CallState
     data class Active(
         val callId: String,
         val recipientId: String,
-        val targetIp: String
+        val isRelay: Boolean = false // <-- ADDED THIS FLAG
     ) : CallState
 }
-
 
 @Composable
 fun CallScreen(

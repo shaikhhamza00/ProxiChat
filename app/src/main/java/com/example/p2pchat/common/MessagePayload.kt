@@ -42,6 +42,33 @@ sealed class MessagePayload {
     data class CallAccept(val callId: String, val receiverIp: String) : MessagePayload()
 
 
+//    @Serializable
+//    @SerialName("call_reject")
+//    data class CallReject(val callId: String) : MessagePayload()
+//
+//    @Serializable
+//    @SerialName("call_hangup")
+//    data class CallHangup(val callId: String) : MessagePayload()
+
+    @Serializable
+    @SerialName("wrtc_offer")
+    // This replaces your CallRequest
+    data class WrtcOffer(val sdp: String) : MessagePayload()
+
+    @Serializable
+    @SerialName("wrtc_answer")
+    // This replaces your CallAccept
+    data class WrtcAnswer(val sdp: String) : MessagePayload()
+
+    @Serializable
+    @SerialName("wrtc_ice_candidate")
+    data class WrtcIceCandidate(
+        val sdpMid: String,
+        val sdpMLineIndex: Int,
+        val candidate: String
+    ) : MessagePayload()
+
+    // You can keep CallReject and CallHangup as they are
     @Serializable
     @SerialName("call_reject")
     data class CallReject(val callId: String) : MessagePayload()
@@ -49,4 +76,12 @@ sealed class MessagePayload {
     @Serializable
     @SerialName("call_hangup")
     data class CallHangup(val callId: String) : MessagePayload()
+
+    @Serializable
+    @SerialName("switch_to_relay")
+    data class SwitchToRelay(val callId: String) : MessagePayload()
+
+    @Serializable
+    @SerialName("audio_data")
+    data class AudioData(val data: ByteArray) : MessagePayload()
 }
